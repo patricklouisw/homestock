@@ -2,7 +2,7 @@
 
 from typing import Annotated, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class HealthCheck(BaseModel):
@@ -12,6 +12,8 @@ class HealthCheck(BaseModel):
 
 class Space(BaseModel):
     """Response model for a single Space."""
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     name: str
 

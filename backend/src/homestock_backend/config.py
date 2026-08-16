@@ -11,5 +11,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env")
 
     database_url: str
+    sql_echo: bool = False
 
 settings = Settings() # type: ignore[call-arg]
