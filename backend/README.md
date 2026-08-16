@@ -36,3 +36,4 @@ Grant permission for the role homestock_app to see objects in the schema
 4. Create config files (.env)
 
 - Refer to .env.example
+  `DATABASE_URL=postgresql://user:password@localhost:5432/home_inventory`
