@@ -1,0 +1,136 @@
+HOMESTOCK — LEARNING CHECKPOINT QUESTIONS
+=========================================
+
+A running log of the end-of-phase checkpoint questions.
+Answer in your own words, without looking things up.
+The goal is to be able to explain these in an interview.
+
+
+-----------------------------------------------------------
+PHASE 1 — REPOSITORY AND ENGINEERING WORKFLOW
+-----------------------------------------------------------
+
+Q1. You made a commit, then pushed. What actually changed on GitHub at
+    each of those two moments -- and why does that mean a commit is not
+    a backup?
+
+Q2. You edited a file, ran `git add`, then `git commit`. Describe what
+    lives in the working directory, the staging area, and the local
+    repository right after each step. Why does Git bother with a staging
+    area at all instead of committing everything changed?
+
+Q3. `origin` -- what is it, concretely? If you renamed it to `github`,
+    what would break?
+
+Q4. After merging your PR on GitHub, your local `main` was still behind.
+    Explain why, in terms of local vs. remote repositories.
+
+Q5. What is `.gitignore` actually doing? If you had already committed a
+    `.env` file and *then* added it to `.gitignore`, would the secret be
+    safe? Why or why not?
+
+
+CORRECTIONS TO REMEMBER (Phase 1)
+---------------------------------
+
+* The local repo stores a chain of COMMITS, each a full snapshot of every
+  tracked file, linked to its parent. Not "the files you intended" and not
+  a pile of diffs.
+
+* `git fetch` does NOT move your local `main`. It only updates the
+  remote-tracking pointer `origin/main`:
+
+      main         -> old commit   (yours, unchanged)
+      origin/main  -> new commit   (what GitHub has)
+
+  You still need `git merge origin/main` to move `main` forward.
+  `git pull` is those two commands stapled together. Knowing they are
+  separate lets you fetch, inspect with `git log main..origin/main`,
+  and then decide.
+
+* `.gitignore` only applies to files Git is NOT already tracking. Once
+  `.env` is committed, Git tracks it and adding it to `.gitignore`
+  changes nothing. You need `git rm --cached .env` to stop tracking it.
+
+* "Safe because I haven't pushed" is the wrong mental model. The secret
+  sits in a commit object in history. Deleting the file in a LATER commit
+  does not remove it -- anyone can check out the older commit and read it.
+  Cleaning it means rewriting history (git filter-repo, BFG). If it was
+  ever pushed to a public remote, ROTATE THE CREDENTIAL; assume it was
+  scraped.
+
+  Rule: prevent secrets from ever entering a commit. A leaked secret is a
+  rotation problem, not a Git problem.
+
+
+-----------------------------------------------------------
+PHASE 2 — HTTP AND FASTAPI FUNDAMENTALS
+-----------------------------------------------------------
+
+Q1. `POST /spaces` returns 201, `DELETE` returns 204, and a missing space
+    returns 404. What does each code communicate that a plain 200
+    wouldn't -- and why is returning 500 for a missing resource actually
+    wrong, not just unhelpful?
+
+Q2. You have `SpaceCreateRequest`, `SpacePatchRequest`, and `Space`. Why
+    not one model for all three? Give a concrete thing that breaks if you
+    merge them.
+
+Q3. A client POSTs `{"id": "999", "name": "Garage"}`. Walk through what
+    FastAPI does with that `id` field, and why. Then explain why the same
+    mechanism matters much more in Phase 9.
+
+Q4. `PATCH {}` returns 200 and changes nothing, but `PATCH {"name": ""}`
+    returns 422. Both are "empty" from a naive view. What distinguishes
+    them, and where in your code is each decided?
+
+Q5. Your spaces live in a module-level list. Restart the server and
+    everything you created is gone. Beyond persistence, name one problem
+    this design has that PostgreSQL solves -- think about what happens
+    with two Uvicorn workers instead of one.
+
+
+ANSWERS
+-------
+
+(write your answers here)
+
+
+-----------------------------------------------------------
+DEBUGGING LESSONS WORTH KEEPING (Phase 2)
+-----------------------------------------------------------
+
+* Import names are not file paths. A module inside a package is never
+  importable by its bare name. `schemas.py` next to `main.py` is
+  `homestock_backend.schemas`, never `schemas`.
+
+  But third-party packages ARE top-level, because site-packages is
+  directly on sys.path:
+
+      from fastapi import FastAPI                     # correct
+      from homestock_backend.schemas import Space     # correct
+
+  Same rule, different answers -- the packages sit at different depths
+  relative to a sys.path entry.
+
+* Read the WHOLE traceback. Python puts the proximate cause LAST.
+  "import fastapi failed" looked like "fastapi isn't installed"; the real
+  cause at the bottom was an x86_64 .so on an arm64 Mac -- a completely
+  different problem with a completely different fix.
+
+* "It works when I run it" is not proof. `uv run python` and
+  `.venv/bin/python` differed by architecture, invisibly, until something
+  needed a compiled binary. When two ways of invoking the same tool
+  behave differently, the difference in the ENVIRONMENT is the bug.
+
+* `Optional[X]` means "may be None". It does NOT mean "may be omitted".
+  Required-ness comes from the absence of a default. `Optional[str]` with
+  no default is required AND nullable.
+
+* `activating` a venv just prepends `.venv/bin` to PATH. No deeper magic.
+  That is why `uv run` and an explicit `.venv/bin/python` reach the same
+  interpreter without activation.
+
+* An editor config that accepts imports Python rejects is worse than no
+  config. (The extra `analysis.extraPaths` entry made Pylance approve a
+  broken import.)
