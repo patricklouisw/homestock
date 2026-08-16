@@ -1,0 +1,21 @@
+[project]
+name = "homestock-backend"
+version = "0.1.0"
+description = "HomeStock Backend"
+readme = "README.md"
+authors = [
+    { name = "Patrick Louis", email = "patricklouisw@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi[standard]>=0.141.1",
+    "pydantic>=2.13.4",
+    "uuid>=1.30",
+    "uvicorn>=0.52.3",
+]
+
+[project.scripts]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
