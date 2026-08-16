@@ -9,9 +9,9 @@
 | `.env` / `.env.example` | done |
 | `psycopg` driver installed | done |
 | `config.py` | done |
-| `database.py` | in progress |
-| `models.py` | not started |
-| Alembic migrations | not started |
+| `database.py` | done |
+| `models.py` | done |
+| Alembic migrations | done |
 | Routes switched from `store.py` to the database | not started |
 
 ---
@@ -446,6 +446,198 @@ String(36)      the SQL type      → VARCHAR(36) in Postgres
   That is deliberate: the database does not assume every writer came through
   your API.
 
+### 8. Alembic migrations
+
+#### Why not `Base.metadata.create_all()`
+
+It works exactly once. It creates tables that do not exist and **silently ignores
+tables that do**. Add a column to an existing table and it does nothing at all —
+it understands absence, not change. Fine for throwaway test databases, useless
+for anything holding data you care about.
+
+#### What a migration is
+
+A Python file with two functions — `upgrade()` applies a change, `downgrade()`
+undoes it. Each file is a **revision** with a pointer to the one before it, so
+they form a linked list:
+
+```text
+None ──▶ 2ea785dfaa7e ──▶ (next) ──▶ (head)
+         down_revision=None
+```
+
+- **`head`** — the newest revision
+- **`down_revision`** — pointer to the previous revision; this defines the order
+- **`base`** — the empty database, before any migration
+
+Alembic records where the *database* currently sits in a table called
+`alembic_version`, holding exactly one row:
+
+```text
+database says:  "I am at 2ea785dfaa7e"
+repo says:      "head is <newest file>"
+upgrade head →  runs everything in between, updates the row
+```
+
+That is why migrations work across machines. A fresh database says "I am at
+nothing," so `upgrade head` replays every migration in order.
+
+#### Setup
+
+```bash
+cd backend
+uv add alembic
+uv run alembic init alembic     # second arg = directory name for scripts
+```
+
+Produces:
+
+```text
+backend/
+├── alembic.ini
+└── alembic/
+    ├── env.py            ← edit this
+    ├── script.py.mako    template for generated migrations
+    └── versions/         migration files land here
+```
+
+#### Keep the database URL out of `alembic.ini`
+
+`alembic.ini` ships with:
+
+```ini
+sqlalchemy.url = driver://user:pass@localhost/dbname
+```
+
+**Leave that placeholder alone.** `alembic.ini` is committed to Git; putting the
+real URL there commits a password. Inject it at runtime in `env.py` instead,
+where it comes from `.env`.
+
+Verify before every push:
+
+```bash
+git diff --staged backend/alembic.ini
+```
+
+#### `alembic/env.py` changes
+
+Add three imports:
+
+```python
+from homestock_backend.config import settings
+from homestock_backend.database import Base
+from homestock_backend import models  # noqa: F401 — registers tables on Base.metadata
+```
+
+The third looks unused and linters will flag it — hence the `noqa`. **It is
+doing the essential work.** Remove it and every generated migration is empty.
+
+After `config = context.config`, add:
+
+```python
+config.set_main_option("sqlalchemy.url", settings.database_url)
+```
+
+Change `target_metadata = None` to:
+
+```python
+target_metadata = Base.metadata
+```
+
+This is what autogenerate compares the live database against. Left as `None`,
+Alembic has no idea what the schema should be.
+
+#### Generate, inspect, apply
+
+```bash
+uv run alembic current                                      # no output = nothing applied
+uv run alembic revision --autogenerate -m "create spaces table"
+```
+
+Autogenerate compares `Base.metadata` to the live database and writes the
+difference. It is a **draft, not an oracle**. It reliably detects added and
+removed tables and columns. It does **not** reliably detect:
+
+- **renames** — it sees a drop plus an add, which means data loss
+- server defaults, some constraint changes, most index details
+- anything needing data transformation
+
+**Always read the generated file before applying it.** Expected content for the
+first one:
+
+```python
+revision: str = "2ea785dfaa7e"
+down_revision = None                  # first migration
+
+def upgrade() -> None:
+    op.create_table(
+        "spaces",
+        sa.Column("id", sa.String(length=36), nullable=False),
+        sa.Column("name", sa.String(length=100), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+    )
+
+def downgrade() -> None:
+    op.drop_table("spaces")
+```
+
+Then:
+
+```bash
+uv run alembic upgrade head
+```
+
+Verify in Postgres:
+
+```bash
+docker exec -it homestock-db psql -U homestock_app -d home_inventory -c "\dt"
+docker exec -it homestock-db psql -U homestock_app -d home_inventory -c "\d spaces"
+docker exec -it homestock-db psql -U homestock_app -d home_inventory -c "SELECT * FROM alembic_version;"
+```
+
+Expect `spaces` **and** `alembic_version`, the right column types, and a
+`version_num` matching the migration filename.
+
+#### Test the downgrade path
+
+```bash
+uv run alembic downgrade -1      # back one revision
+uv run alembic upgrade head      # forward again
+```
+
+A migration you cannot reverse is a deploy you cannot roll back. Testing
+`downgrade()` is how you discover that autogenerate wrote one that does not
+actually work — which happens more than you would like.
+
+#### The reproducibility test
+
+```bash
+docker exec -it homestock-db psql -U postgres -d home_inventory \
+  -c "DROP TABLE IF EXISTS spaces; DROP TABLE IF EXISTS alembic_version;"
+
+uv run alembic upgrade head
+```
+
+A blank database brought to the correct schema by one command, no manual steps.
+That is what makes the schema reproducible on a teammate's laptop, in CI, and on
+RDS.
+
+#### Gotcha: the empty migration
+
+If autogenerate reports nothing and produces an empty `upgrade()`, `env.py` did
+not import your models. `Base.metadata` fills as a **side effect of class
+definitions executing** — no import, no classes, no tables in the registry, and
+Alembic concludes the database is already correct.
+
+This is the same mechanism as the `list(Base.metadata.tables)` check, now with
+consequences.
+
+#### Migration files are source code
+
+Commit `alembic.ini`, `alembic/env.py`, `alembic/script.py.mako`, and everything
+in `alembic/versions/`. They are the history of your schema. `__pycache__/` in
+those directories is already covered by `.gitignore`.
+
 ---
 
 ## Verify
@@ -522,11 +714,9 @@ Alembic will need.
 
 ## Still to do
 
-1. **Alembic** — `alembic init`, point `env.py` at `Base.metadata`, generate and
-   inspect the first migration, upgrade, downgrade, upgrade again.
-2. **Switch the routes** — replace `store.py` with database queries via
+1. **Switch the routes** — replace `store.py` with database queries via
    `Depends(get_db)`. The endpoints, schemas, and status codes must not change.
    This is a refactor: if route *logic* needs editing, the layers were not as
    separate as they looked.
-3. **Verify persistence across app restarts** — create a space, restart uvicorn,
+2. **Verify persistence across app restarts** — create a space, restart uvicorn,
    confirm it is still there. That is the thing the whole phase exists for.
