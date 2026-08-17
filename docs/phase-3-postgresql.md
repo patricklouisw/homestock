@@ -1,6 +1,6 @@
 # Phase 3 — PostgreSQL and Persistence
 
-**Status: in progress.**
+**Status: complete.**
 
 | Task | State |
 |---|---|
@@ -12,7 +12,7 @@
 | `database.py` | done |
 | `models.py` | done |
 | Alembic migrations | done |
-| Routes switched from `store.py` to the database | not started |
+| Routes switched from `store.py` to the database | done |
 
 ---
 
@@ -712,11 +712,157 @@ Alembic will need.
 
 ---
 
+### 9. Switching the routes to the database
+
+The endpoints, schemas, and status codes must not change. Only the data access
+moves. If route *logic* needs editing, the layers were not as separate as they
+looked.
+
+#### The name collision
+
+Two classes called `Space` now need to coexist in `main.py`. Convention that
+reads best — **import the module for models, import names for schemas**:
+
+```python
+from homestock_backend import models
+from homestock_backend.schemas import Space, SpaceRequest, SpaceListResponse
+```
+
+`models.Space` is unmistakably the table; bare `Space` is the API shape.
+
+#### Pydantic must be told it can read objects
+
+Pydantic validates **dicts** by default. A SQLAlchemy row is an object with
+attributes. Add to the `Space` schema only:
+
+```python
+model_config = ConfigDict(from_attributes=True)
+```
+
+Request models stay strict — they are built from JSON.
+
+#### Return annotations
+
+```text
+-> models.Space        what the function returns: a database row
+response_model=Space   what FastAPI serializes it into: the JSON shape
+```
+
+FastAPI converts using `from_attributes`, and `response_model` still filters to
+the declared fields. Annotating `-> Space` while returning a row would be a lie
+the type checker will catch.
+
+#### Query patterns
+
+```python
+db.get(models.Space, space_id)                        # by primary key -> row or None
+db.execute(select(models.Space)).scalars().all()      # everything else
+```
+
+`scalars()` unwraps each result from a one-element tuple. Without it you get
+`[(<Space>,), (<Space>,)]`, because a query may select multiple things.
+
+`db.query(...)` is legacy 1.x style; 2.0 code uses `select()`.
+
+#### Writes
+
+```python
+db.add(obj);    db.commit(); db.refresh(obj)    # create
+obj.name = "x"; db.commit()                     # update — no update() call
+db.delete(obj); db.commit()                     # delete
+```
+
+**There is no `update()`.** The session keeps a snapshot of each loaded row,
+compares it on flush, and emits `UPDATE` for the changed columns. You mutate
+objects; the session generates the SQL. This is the **Unit of Work** pattern.
+
+`refresh()` re-reads the row so database-generated values land on the object.
+Unnecessary when you supplied every value, essential once columns have server
+defaults.
+
+**Every write needs `commit()`.** Without it, `get_db`'s `finally` closes the
+session, the transaction rolls back, and the change vanishes with no error. The
+only signal is `ROLLBACK` instead of `COMMIT` in the echoed SQL.
+
+Commit belongs in the **route**, not `get_db` — only the route knows whether the
+unit of work succeeded.
+
+#### Parameter ordering
+
+`db: Session = Depends(get_db)` has a default, so it must come **after**
+parameters without one, or Python raises at import.
+
+---
+
+## The `get_db` lifecycle, precisely
+
+Verified ordering on this project's FastAPI version:
+
+```text
+ 1. request arrives; FastAPI opens an AsyncExitStack for it
+ 2. Depends(get_db) → generator runs → SessionLocal() → hits `yield`, PAUSES
+ 3. route body runs, queries execute
+ 4. route returns
+ 5. response_model serializes the return value
+ 6. response is sent
+ 7. background tasks run
+ 8. exit stack closes → generator RESUMES → `finally` → db.close()   ← TEARDOWN
+```
+
+FastAPI wraps the generator in a context manager on an exit stack spanning the
+whole request. Exiting the stack calls `next()` again, which raises inside the
+generator and runs the `finally`.
+
+**Teardown is last** — after the response is sent, not when the route returns.
+
+### Why that ordering matters
+
+Serialization (step 5) happens while the session is still open. In Phase 4,
+accessing `space.items` triggers a **lazy load** — a second query fired at
+attribute-access time, during serialization. It works only because teardown is
+step 8. If it ran at step 4 you would get:
+
+```text
+DetachedInstanceError: Instance <Space> is not bound to a Session;
+lazy load operation of attribute 'items' cannot proceed
+```
+
+One of the most common SQLAlchemy errors, and this ordering is why it does not
+happen here.
+
+### Two consequences
+
+- You **cannot** raise `HTTPException` in the `finally` — the response is gone.
+- The `finally` **does** run when the route raises, including on a 404. That is
+  the entire reason for `try/finally` rather than a plain `db.close()` after the
+  yield. Without it, every error leaks a connection, and ~100 of those means
+  Postgres stops accepting new ones.
+
+### What `db.close()` actually does
+
+Not what the name suggests — it does **not** close the TCP connection:
+
+```text
+db.close()
+├── rolls back any open transaction
+├── expunges every object from the identity map
+└── RETURNS the connection to the engine's pool  ← stays open, reusable
+```
+
+That is the point of pooling: creating a session is cheap because it borrows an
+already-open connection, and closing it is cheap because it gives it back.
+
+A `SELECT`-only request ends with `ROLLBACK` in the log. That is expected — a
+read opens an implicit transaction, nothing needed committing, and `close()`
+ended it the safe way.
+
+---
+
 ## Still to do
 
-1. **Switch the routes** — replace `store.py` with database queries via
-   `Depends(get_db)`. The endpoints, schemas, and status codes must not change.
-   This is a refactor: if route *logic* needs editing, the layers were not as
-   separate as they looked.
-2. **Verify persistence across app restarts** — create a space, restart uvicorn,
-   confirm it is still there. That is the thing the whole phase exists for.
+Nothing in Phase 3. Carried into later phases:
+
+- **`sql_echo` is not in `.env.example`** — the setting exists in `Settings` but
+  the example file does not document it. Add it.
+- Consider Postgres's native `UUID` column type instead of `String(36)` — a good
+  one-line migration exercise.

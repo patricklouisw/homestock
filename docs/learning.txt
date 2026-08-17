@@ -134,3 +134,173 @@ DEBUGGING LESSONS WORTH KEEPING (Phase 2)
 * An editor config that accepts imports Python rejects is worse than no
   config. (The extra `analysis.extraPaths` entry made Pylance approve a
   broken import.)
+
+* Not every type-checker complaint is a bug. Two cases, opposite fixes:
+    - list[dict] vs list[Space]  -> the checker was RIGHT. Real ambiguity.
+    - Settings() "missing arg"   -> the checker was WRONG. It cannot model
+                                    BaseSettings reading env before validating.
+  The question that separates them: "is there an input that makes this
+  actually break?" Reaching for `# type: ignore` as a reflex rots a
+  codebase; reaching for it after proving the checker wrong is correct.
+
+
+-----------------------------------------------------------
+PHASE 3 — POSTGRESQL AND PERSISTENCE
+-----------------------------------------------------------
+
+Q1. You have two classes named `Space`, in schemas.py and models.py. Give
+    one concrete thing that breaks if you merge them into one class. Then
+    explain why that same separation is a SECURITY boundary in Phase 9.
+
+ANSWERED: Correct on the distinction -- schemas.py is Pydantic enforcing
+request/response shape, models.py is the SQLAlchemy table.
+
+MISSING:
+  * A concrete break: SpacePatchRequest's OPTIONAL name has nowhere to live
+    in a merged class. "This field may be absent" is meaningful for a
+    request and meaningless for a table -- a row always has every column.
+    You would also lose the id-cannot-be-set-by-client protection, since a
+    merged model needs `id` as a field.
+  * The Phase 9 security half: the User MODEL will have hashed_password.
+    The User SCHEMA will not. Since response_model is an allowlist, the
+    hash physically CANNOT reach a response -- not because you remembered
+    to strip it, but because the response class has no such field.
+    That is the difference between a convention you must remember and a
+    boundary that holds by construction.
+
+
+Q2. A route calls db.add(space) and returns successfully, but the row is
+    not in the database afterwards. No error raised. What happened?
+
+ANSWERED: Correct. Missing db.commit(). db.close() in get_db's finally
+closes the session, and an open transaction is rolled back on close.
+
+Note: with echo on, the tell is `ROLLBACK` where you expected `COMMIT`.
+That is the only visible signal -- there is no exception and no log line
+at default settings.
+
+
+Q3. patch_a_space never calls db.update(). It mutates an attribute and
+    calls commit(). How does SQLAlchemy know an UPDATE is needed, and what
+    does that tell you about what a session IS?
+
+ANSWERED: Right mechanism, but "not sure what this tells me about a
+session."
+
+THE MECHANISM, precisely: when the session loads a row it keeps a SNAPSHOT
+of the original column values. On flush it compares current attribute
+values to that snapshot and emits UPDATE for only the changed columns.
+
+WHAT A SESSION IS: not a connection, not a query API. An in-memory
+workspace holding objects and tracking their state. It maintains three
+things:
+
+    IDENTITY MAP     one Python object per database row, per session.
+                     db.get(Space, "1") twice -> the SAME object, one query.
+
+    CHANGE TRACKING  the loaded snapshot of every object, so it can compute
+                     what changed without being told.
+
+    TRANSACTION      the boundary. Everything staged succeeds or fails
+                     together.
+
+That is why the pattern is "mutate objects, then commit" rather than
+"issue an UPDATE". SQLAlchemy calls this the UNIT OF WORK pattern -- worth
+knowing by name.
+
+
+Q4. Base.metadata.create_all() would have made the spaces table in one
+    line. Describe a Phase 4 change where create_all() does nothing useful.
+
+ANSWERED: "Not sure. Alembic is git for the db" -- the instinct is right
+but incomplete.
+
+THE CONCRETE CASE: you add inventory_items with a FK to spaces.
+create_all() handles that fine -- the table does not exist, so it is
+created. A week later items need a `notes` column. You add it to the model
+and run create_all():
+
+    Does table "inventory_items" exist?  Yes.  -> skip.
+
+NOTHING HAPPENS. No column, no error, no warning. The model says the
+column exists, the database says it does not, and the first query touching
+`notes` fails with UndefinedColumn -- at runtime, in production.
+
+create_all() only understands ABSENCE. It has no concept of DIFFERENCE.
+
+Alembic compares model to database, sees the missing column, and generates
+add_column/drop_column -- a file you read, commit, and apply to laptop,
+CI, and production in that order, reproducibly, with a way back.
+
+    create_all() handles the first day.
+    Alembic handles every day after.
+
+
+Q5. One engine per application, one session per request. What goes wrong
+    if you flip either?
+
+ANSWERED: Got the engine half -- connection exhaustion against Postgres's
+~100 limit. Asked for the session half.
+
+NEW ENGINE PER REQUEST: worse than just the limit. Each engine builds its
+OWN pool, so you pay connection setup every request AND leak pools.
+
+ONE SHARED SESSION FOR ALL REQUESTS -- three separate failures:
+
+ 1. Sessions are not thread-safe. FastAPI runs plain `def` routes in a
+    threadpool, so several run concurrently. Two threads mutating one
+    identity map and pending-changes list corrupt both. Errors that do not
+    reproduce and do not point at the cause.
+
+ 2. Transactions bleed across users. A session IS a transaction. If user
+    A has staged changes and user B calls commit(), A's half-finished work
+    is committed too. Flip it: B calls rollback() after an error and A's
+    completed work is destroyed. Neither user did anything wrong.
+
+ 3. Stale data forever. The identity map returns the same Python object
+    for a given row and is never cleared, so once loaded, that object is
+    what everyone sees -- even after another process updates the row.
+
+All three trace to one fact: a session holds mutable per-unit-of-work
+state.
+
+    ENGINE   stateless w.r.t. your work, expensive to create  -> share it
+    SESSION  stateful, cheap to create                        -> do not
+
+
+-----------------------------------------------------------
+DEBUGGING LESSONS WORTH KEEPING (Phase 3)
+-----------------------------------------------------------
+
+* A SQLAlchemy URL scheme has TWO parts: dialect+driver.
+  `postgresql://` uses the dialect DEFAULT driver, which is psycopg2.
+  This project uses psycopg 3, so the URL must say
+  `postgresql+psycopg://` or you get ModuleNotFoundError: psycopg2.
+  Be explicit -- defaults change between library versions.
+
+* Environment variables BEAT .env in pydantic-settings. That is deliberate
+  (it is how CI and AWS inject config), but a stale `export DATABASE_URL=`
+  in your shell silently overrides file edits, and the symptom looks
+  identical to "my edit did not work."
+
+* env_file=".env" resolves relative to the CURRENT WORKING DIRECTORY, not
+  to config.py. Always `cd backend` first.
+
+* Autogenerate is a DRAFT, not an oracle. It cannot see renames -- it
+  reports a dropped column plus a new one, which is data loss. Always read
+  the generated migration before applying it.
+
+* An empty autogenerated migration means env.py did not import your models.
+  Base.metadata fills as a SIDE EFFECT of class definitions executing.
+
+* Two debugging cycles were lost to UNSAVED EDITOR BUFFERS (config.py, then
+  .env). When a fix "does not work," check the file on disk:
+      cat .env
+  Turn on VS Code Files: Auto Save.
+
+* `grep -r` searches binaries. __pycache__/*.pyc keep old strings alive and
+  produce false matches. Use `grep -r --include="*.py"` or `git grep`.
+
+* db.close() does NOT close the TCP connection. It rolls back any open
+  transaction, expunges the identity map, and RETURNS the connection to the
+  pool. That is what makes sessions cheap to create and destroy.

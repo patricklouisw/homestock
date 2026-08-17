@@ -17,7 +17,8 @@ Each phase document contains:
 |---|---|---|
 | 1 | [Git, GitHub, and repository structure](phase-1-git-and-repo.md) | complete |
 | 2 | [HTTP and FastAPI — in-memory CRUD](phase-2-fastapi.md) | complete |
-| 3 | [PostgreSQL and persistence](phase-3-postgresql.md) | in progress |
+| 3 | [PostgreSQL and persistence](phase-3-postgresql.md) | complete |
+| 4 | Inventory domain — foreign keys and relationships | next |
 
 ## Related
 
