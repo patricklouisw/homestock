@@ -5,9 +5,8 @@ from sqlalchemy import pool
 
 from alembic import context
 
-from homestock_backend.config import settings
-from homestock_backend.database import Base
-from homestock_backend import models  # noqa: F401 — registers tables on Base.metadata
+from homestock_backend.core.config import settings
+from homestock_backend.database.base import Base
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
